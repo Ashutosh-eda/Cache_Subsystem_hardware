@@ -1,0 +1,182 @@
+// ================================================================
+// tb_lru_4way.v  ▪  TRUE-LRU self-checking testbench + waveforms
+// ---------------------------------------------------------------
+//   • VCD dumpfile: lru_4way.vcd
+//   • Prints a full 4-row GOLDEN table first, then a 4-row RTL table
+// ================================================================
+`timescale 1ns/1ps
+`include "cache_defs.vh"
+
+module tb_lru_4way;
+
+  //----------------------------------------------------------------
+  // DUT I/O
+  //----------------------------------------------------------------
+  reg                          clk, reset, update_en;
+  reg  [`INDEX_WIDTH-1:0]      set_idx, query_idx;
+  reg  [1:0]                   accessed_way;
+  wire [1:0]                   victim_way;
+
+  lru_4way dut (.*);
+
+  //----------------------------------------------------------------
+  // 100-MHz clock
+  //----------------------------------------------------------------
+  initial clk = 0;
+  always  #5 clk = ~clk;
+
+  //----------------------------------------------------------------
+  // Positive-mod $random helper
+  //----------------------------------------------------------------
+  function integer rand_pos;
+    input integer mod; integer tmp;
+    begin
+      tmp = $random; if (tmp < 0) tmp = -tmp;
+      rand_pos = tmp % mod;
+    end
+  endfunction
+
+  //----------------------------------------------------------------
+  // Golden TRUE-LRU model
+  //----------------------------------------------------------------
+  reg [1:0] age_sw [0:(1<<`INDEX_WIDTH)-1][0:3];
+
+  function [1:0] sw_victim;
+    input integer s; integer w; reg [1:0] max;
+    begin
+      max = 0; sw_victim = 0;
+      for (w = 0; w < 4; w = w + 1)
+        if (age_sw[s][w] >= max) begin
+          max       = age_sw[s][w];
+          sw_victim = w[1:0];
+        end
+    end
+  endfunction
+
+  task sw_update;
+    input integer s, hit; integer w; reg [1:0] oa;
+    begin
+      oa = age_sw[s][hit];
+      for (w = 0; w < 4; w = w + 1)
+        if (w == hit)               age_sw[s][w] = 0;
+        else if (age_sw[s][w] < oa) age_sw[s][w] = age_sw[s][w] + 1;
+    end
+  endtask
+
+  //----------------------------------------------------------------
+  // Local variables
+  //----------------------------------------------------------------
+  integer   i, s, k;
+  integer   set_list [0:9];
+  integer   bag      [0:3];
+  integer   order    [0:3];
+  integer   bag_n, rnd;
+
+  // Arrays to hold per-hit data so we can print in the desired order
+  reg [1:0] way_arr   [0:3];
+  reg [1:0] vic_pre   [0:3];
+  reg [1:0] vic_exp   [0:3];
+  reg [1:0] vic_post  [0:3];
+
+  integer   fails = 0;
+
+  //----------------------------------------------------------------
+  // Testbench body
+  //----------------------------------------------------------------
+  initial begin
+    //---------------- Waveforms ----------------
+    $dumpfile("lru_4way.vcd");
+    $dumpvars(0, tb_lru_4way);
+
+    $display("\n== TRUE LRU Test    10 sets × 4 hits ==");
+
+    //---------------- Reset DUT + golden model --
+    reset = 1; update_en = 0;
+    @(posedge clk); reset = 0;
+    for (i = 0; i < (1<<`INDEX_WIDTH); i = i + 1) begin
+      age_sw[i][0]=0; age_sw[i][1]=1; age_sw[i][2]=2; age_sw[i][3]=3;
+    end
+
+    //---------------- Pick 10 distinct sets -----
+    i = 0;
+    while (i < 10) begin
+      rnd = rand_pos(128);
+      for (s = 0; s < i; s = s + 1)
+        if (set_list[s] == rnd) rnd = -1;
+      if (rnd >= 0) set_list[i++] = rnd;
+    end
+
+    //---------------- Main test loop -----------
+    for (s = 0; s < 10; s = s + 1) begin
+      set_idx   = set_list[s];
+      query_idx = set_idx;
+      @(posedge clk);  // prime victim_way
+
+      // --- random order of hits for this set ---
+      bag[0]=0; bag[1]=1; bag[2]=2; bag[3]=3; bag_n = 4;
+      for (k = 0; k < 4; k = k + 1) begin
+        rnd      = rand_pos(bag_n);
+        order[k] = bag[rnd];
+        for (i = rnd; i < bag_n-1; i = i + 1) bag[i] = bag[i+1];
+        bag_n = bag_n - 1;
+      end
+
+      $display("\n>>> SET %0d  order = %0d %0d %0d %0d",
+               set_idx, order[0],order[1],order[2],order[3]);
+
+      // ------------- 4 hits --------------------
+      for (k = 0; k < 4; k = k + 1) begin
+        // record pre-state victim
+        vic_pre[k] = victim_way;
+
+        // hit the chosen way
+        accessed_way = order[k][1:0];
+        way_arr[k]   = accessed_way;
+
+        update_en = 1;
+        @(posedge clk);
+        update_en = 0;
+        sw_update(set_idx, accessed_way);   // update golden model
+
+        @(posedge clk);                     // advance one more clk
+        vic_post[k] = victim_way;           // RTL after update
+        vic_exp[k]  = sw_victim(set_idx);   // Golden after update
+
+        // ----------------- self-checks ----------
+        if (vic_post[k] == accessed_way) begin
+          $display("       MRU chosen as victim! (idx=%0d)", k);
+          fails = fails + 1;
+        end
+        if (vic_post[k] !== vic_exp[k]) begin
+          $display("       RTL vs golden mismatch at idx %0d: victim=%0d exp=%0d",
+                   k, vic_post[k], vic_exp[k]);
+          fails = fails + 1;
+        end
+      end  // for k
+
+      // ---------- print GOLDEN table first -----------
+      $display("\n       EXPECTED (Golden) ");
+      $display(" idx | way | vicPRE | expGOLDEN");
+      $display("---- | --- | ------ | ---------");
+      for (k = 0; k < 4; k = k + 1)
+        $display("  %0d  |  %0d  |   %0d    |    %0d",
+                 k, way_arr[k], vic_pre[k], vic_exp[k]);
+
+      // ---------- then print RTL table ---------------
+      $display("\n       RTL (DUT) ");
+      $display(" idx | way | vicPRE | vicPOST");
+      $display("---- | --- | ------ | -------");
+      for (k = 0; k < 4; k = k + 1)
+        $display("  %0d  |  %0d  |   %0d    |    %0d",
+                 k, way_arr[k], vic_pre[k], vic_post[k]);
+    end  // for each set
+
+    //---------------- Verdict -----------------------
+    if (fails == 0)
+      $display("\n==   ALL TESTS PASSED  ==");
+    else
+      $display("\n==   %0d MISMATCHES  ==", fails);
+
+    $finish;
+  end
+endmodule
